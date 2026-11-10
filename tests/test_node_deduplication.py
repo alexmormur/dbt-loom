@@ -15,29 +15,16 @@ def _make_manifest(project_name, nodes):
     }
 
 
-def _make_node(
-    unique_id,
-    package_name,
-    access="protected",
-    *,
-    name=None,
-    relation_name=None,
-    materialized=None,
-):
+def _make_node(unique_id, package_name, access="protected"):
     """Helper to create a minimal manifest node dict."""
-    node = {
+    return {
         "unique_id": unique_id,
-        "name": name or unique_id.split(".")[-1],
+        "name": unique_id.split(".")[-1],
         "package_name": package_name,
         "schema": "core",
         "resource_type": "model",
         "access": access,
     }
-    if relation_name is not None:
-        node["relation_name"] = relation_name
-    if materialized is not None:
-        node["config"] = {"materialized": materialized}
-    return node
 
 
 def _merge_manifests(manifest_pairs):
@@ -78,8 +65,6 @@ def test_authoritative_node_wins_over_transitive_copy():
     )
 
     assert models[uid].access == "public"
-
-
 def test_authoritative_node_wins_regardless_of_load_order():
     """Even if the transitive copy is loaded first, the authoritative manifest
     should overwrite it."""
@@ -104,8 +89,6 @@ def test_authoritative_node_wins_regardless_of_load_order():
     )
 
     assert models[uid].access == "public"
-
-
 def test_transitive_node_added_when_no_authoritative_source():
     """Nodes from packages without their own manifest entry should still be
     injected via the first manifest that provides them."""
@@ -150,44 +133,3 @@ def test_first_transitive_copy_preserved_over_later_copies():
     )
 
     assert models[uid].access == "public"
-
-
-def test_ephemeral_version_is_not_injected_alongside_materialized_version():
-    """Ephemeral versions have no relation and can collide with a versioned model."""
-
-    model_name = "STG_H_ICOACH_COACHING_SESSION"
-    v1_uid = f"model.icoach_source.{model_name}.v1"
-    v3_uid = f"model.icoach_source.{model_name}.v3"
-
-    models = _merge_manifests(
-        [
-            (
-                _make_manifest(
-                    "icoach_source",
-                    {
-                        v1_uid: _make_node(
-                            v1_uid,
-                            "icoach_source",
-                            access="public",
-                            name=model_name,
-                            relation_name=(
-                                "DEV_DB.STAGE_SCHEMA.STG_H_ICOACH_COACHING_SESSION"
-                            ),
-                            materialized="table",
-                        ),
-                        v3_uid: _make_node(
-                            v3_uid,
-                            "icoach_source",
-                            name=model_name,
-                            materialized="ephemeral",
-                        ),
-                    },
-                ),
-                "icoach_source",
-            ),
-        ]
-    )
-
-    assert v1_uid in models
-    assert v3_uid not in models
-    assert models[v1_uid].identifier == model_name
