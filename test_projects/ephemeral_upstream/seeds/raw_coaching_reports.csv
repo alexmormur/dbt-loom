@@ -1,0 +1,5 @@
+report_id,tenant,edw_dt_load,source_system
+1,emea,2024-01-05,coaching_report
+2,emea,2024-02-10,coaching_report
+3,amer,2025-06-01,coaching_report
+4,amer,1900-01-01,coaching_report

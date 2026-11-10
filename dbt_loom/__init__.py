@@ -1,12 +1,15 @@
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 import os
 import re
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import yaml
 from dbt.contracts.graph.node_args import ModelNodeArgs
 from dbt.contracts.graph.nodes import ModelNode
+from dbt.exceptions import CompilationError
+from dbt.graph.selector import NodeSelector
 
 from dbt.plugins.manager import dbt_hook, dbtPlugin
 from dbt.plugins.manifest import PluginNodes
@@ -19,12 +22,30 @@ try:
 except ModuleNotFoundError:
     from dbt.node_types import NodeType  # type: ignore
 
+try:
+    from dbt.artifacts.resources import RefArgs
+except ImportError:
+    from dbt.contracts.graph.nodes import RefArgs  # type: ignore
+
 
 from dbt_loom.config import ManifestReference, dbtLoomConfig
 from dbt_loom.logging import fire_event
 from dbt_loom.manifests import ManifestLoader, ManifestNode
 
 import importlib.metadata
+
+
+_LOOM_ONLY_ARGS = (
+    "resource_type",
+    "group",
+    "config",
+    "alias",
+    "raw_code",
+    "language",
+    "refs",
+    "depends_on_macros",
+    "depends_on_sources",
+)
 
 
 @dataclass
@@ -34,18 +55,31 @@ class LoomModelNodeArgs(ModelNodeArgs):
     resource_type: NodeType = NodeType.Model
     group: Optional[str] = None
     event_time: Optional[str] = None
+    materialized: Optional[str] = None
+    raw_code: Optional[str] = None
+    language: str = "sql"
+    refs: List[Dict] = field(default_factory=list)
+    depends_on_macros: List[str] = field(default_factory=list)
+    depends_on_sources: List[str] = field(default_factory=list)
 
     def __init__(self, **kwargs):
         super().__init__(
             **{
                 key: value
                 for key, value in kwargs.items()
-                if key not in ("resource_type", "group", "config")
+                if key not in _LOOM_ONLY_ARGS
             }
         )
+        config = kwargs.get("config") or {}
         self.resource_type = kwargs.get("resource_type", NodeType.Model)
         self.group = kwargs.get("group")
-        self.event_time = kwargs.get("config", {}).get("event_time", None)
+        self.event_time = config.get("event_time", None)
+        self.materialized = config.get("materialized")
+        self.raw_code = kwargs.get("raw_code")
+        self.language = kwargs.get("language") or "sql"
+        self.refs = list(kwargs.get("refs") or [])
+        self.depends_on_macros = list(kwargs.get("depends_on_macros") or [])
+        self.depends_on_sources = list(kwargs.get("depends_on_sources") or [])
 
     @property
     def unique_id(self) -> str:
@@ -54,6 +88,10 @@ class LoomModelNodeArgs(ModelNodeArgs):
             unique_id = f"{unique_id}.v{self.version}"
 
         return unique_id
+
+    @property
+    def is_ephemeral(self) -> bool:
+        return self.resource_type == NodeType.Model and self.materialized == "ephemeral"
 
 
 def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
@@ -73,10 +111,16 @@ def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
         if not node:
             continue
 
-        if (
+        is_ephemeral = (
             node.get("resource_type") == NodeType.Model.value
-            and node.get("config", {}).get("materialized") == "ephemeral"
-        ):
+            and (node.get("config") or {}).get("materialized") == "ephemeral"
+        )
+
+        if is_ephemeral and not node.get("raw_code"):
+            fire_event(
+                msg=f"dbt-loom: Skipping ephemeral model `{unique_id}` because the "
+                "upstream manifest does not include its raw_code."
+            )
             continue
 
         if node.get("access") is None:
@@ -87,7 +131,49 @@ def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
             if node.get(key):
                 node[key] = str(node[key])
 
+        if not is_ephemeral:
+            # Only ephemerals are compiled in the consumer, so don't carry SQL around.
+            node = {
+                key: value
+                for key, value in node.items()
+                if key not in ("raw_code", "refs", "language")
+            }
+
         output[unique_id] = ManifestNode(**(node))
+
+    return output
+
+
+def add_ephemeral_dependencies(
+    selected_nodes: Dict[str, ManifestNode],
+    filtered_nodes: Dict[str, ManifestNode],
+) -> Dict[str, ManifestNode]:
+    """Return ``filtered_nodes`` plus every upstream node that an included
+    ephemeral model depends on (transitively), even if package filters
+    excluded it. Ephemerals are compiled in the consumer, so their refs must
+    resolve there."""
+
+    output = dict(filtered_nodes)
+    stack = [uid for uid, node in filtered_nodes.items() if node.is_ephemeral]
+    visited: Set[str] = set()
+
+    while stack:
+        unique_id = stack.pop()
+        if unique_id in visited:
+            continue
+        visited.add(unique_id)
+
+        node = output.get(unique_id)
+        if node is None or node.depends_on is None:
+            continue
+
+        for dependency in node.depends_on.nodes:
+            dependency_node = selected_nodes.get(dependency)
+            if dependency_node is None:
+                continue
+            output.setdefault(dependency, dependency_node)
+            if dependency_node.is_ephemeral:
+                stack.append(dependency)
 
     return output
 
@@ -100,11 +186,89 @@ def convert_model_nodes_to_model_node_args(
         unique_id: LoomModelNodeArgs(
             schema=node.schema_name,
             identifier=node.identifier,
+            depends_on_macros=node.depends_on_macros,
+            depends_on_sources=node.depends_on_sources,
             **(node.dump()),
         )
         for unique_id, node in selected_nodes.items()
         if node is not None
     }
+
+
+def build_ephemeral_model_node(model: ModelNode, args: LoomModelNodeArgs) -> ModelNode:
+    """Turn an external ModelNode into an ephemeral node that the consumer
+    compiles from the upstream raw_code and inlines as a CTE.
+
+    The node keeps an empty ``path``/``original_file_path`` so dbt still treats
+    it as external: it is dropped and re-injected on every (partial) parse.
+    """
+    model.config.materialized = "ephemeral"
+    model.unrendered_config["materialized"] = "ephemeral"
+    model.relation_name = None
+    model.raw_code = args.raw_code or ""
+    model.language = args.language
+    model.refs = [
+        RefArgs(
+            name=ref["name"],
+            package=ref.get("package"),
+            version=None if ref.get("version") is None else str(ref["version"]),
+        )
+        for ref in args.refs
+    ]
+    model.depends_on.macros = list(args.depends_on_macros)
+    return model
+
+
+_ORIGINAL_ATTRIBUTES: Dict[Tuple[type, str], Callable] = {}
+
+
+def _patch_once(owner: type, attribute: str, wrapper_factory: Callable) -> None:
+    """Wrap the *original* ``owner.attribute``, so that re-initializing the
+    plugin in the same process replaces the wrapper instead of stacking it."""
+    key = (owner, attribute)
+    if key not in _ORIGINAL_ATTRIBUTES:
+        _ORIGINAL_ATTRIBUTES[key] = getattr(owner, attribute)
+    setattr(owner, attribute, wrapper_factory(_ORIGINAL_ATTRIBUTES[key]))
+
+
+def target_write_path_wrapper(function) -> Callable:
+    """Give injected ephemerals a compiled path. They have no file path because
+    dbt must keep treating them as external nodes."""
+
+    def outer_function(inner_self, target_path, subdirectory, *args, **kwargs):
+        if inner_self.is_external_node and inner_self.is_ephemeral_model:
+            return os.path.join(
+                target_path,
+                subdirectory,
+                inner_self.package_name,
+                f"{inner_self.identifier}.sql",
+            )
+        return function(inner_self, target_path, subdirectory, *args, **kwargs)
+
+    return outer_function
+
+
+def graph_member_wrapper(function) -> Callable:
+    """Keep injected ephemerals out of node selection. They belong to the
+    upstream project, so they are only compiled when a consumer node inlines
+    them, never on their own during `dbt compile`, `run` or `build`."""
+
+    def outer_function(inner_self, unique_id) -> bool:
+        node = inner_self.manifest.nodes.get(unique_id)
+        if (
+            isinstance(node, ModelNode)
+            and node.is_external_node
+            and node.is_ephemeral_model
+        ):
+            return False
+        return function(inner_self, unique_id)
+
+    return outer_function
+
+
+class LoomEphemeralDependencyError(CompilationError):
+    """Raised when an injected ephemeral model needs macros or sources that the
+    consumer project does not provide."""
 
 
 def merge_loom_nodes(
@@ -172,7 +336,9 @@ class dbtLoom(dbtPlugin):
         )
 
         dbt.contracts.graph.manifest.Manifest.is_invalid_protected_ref = (  # type: ignore
-            self.dependency_wrapper(is_invalid_protected_ref)
+            self.protected_ephemeral_wrapper(
+                self.dependency_wrapper(is_invalid_protected_ref)
+            )
         )
         dbt.contracts.graph.manifest.Manifest.is_invalid_private_ref = (  # type: ignore
             self.dependency_wrapper(is_invalid_private_ref)
@@ -187,6 +353,12 @@ class dbtLoom(dbtPlugin):
         dbt.contracts.graph.nodes.ModelNode.from_args = (  # type: ignore
             self.model_node_wrapper(dbt.contracts.graph.nodes.ModelNode.from_args)  # type: ignore
         )
+
+        from dbt.parser.manifest import ManifestLoader as DbtManifestLoader
+
+        _patch_once(DbtManifestLoader, "load", self.manifest_load_wrapper)
+        _patch_once(ModelNode, "get_target_write_path", target_write_path_wrapper)
+        _patch_once(NodeSelector, "_is_graph_member", graph_member_wrapper)
 
     def _patch_plugin_telemetry(self) -> None:
         """Patch the plugin telemetry function to prevent tracking of dbt plugins."""
@@ -221,9 +393,113 @@ class dbtLoom(dbtPlugin):
             model = function(args)
             model.group = args.group
             model.config.event_time = args.event_time
+            if getattr(args, "is_ephemeral", False):
+                model = build_ephemeral_model_node(model, args)
             return model
 
         return outer_function
+
+    def protected_ephemeral_wrapper(self, function) -> Callable:
+        """Allow refs to protected, loom-injected ephemerals when opted in."""
+
+        def outer_function(inner_self, node, target_model, dependencies) -> bool:
+            if (
+                self.config is not None
+                and self.config.include_protected_ephemeral
+                and isinstance(target_model, ModelNode)
+                and target_model.is_external_node
+                and target_model.unique_id in self.ephemeral_models
+            ):
+                return False
+
+            return function(inner_self, node, target_model, dependencies)
+
+        return outer_function
+
+    def manifest_load_wrapper(self, function) -> Callable:
+        """Validate injected ephemerals once dbt has finished building the manifest."""
+
+        def outer_function(inner_self, *args, **kwargs):
+            manifest = function(inner_self, *args, **kwargs)
+            self.validate_ephemeral_dependencies(manifest)
+            return manifest
+
+        return outer_function
+
+    @property
+    def ephemeral_models(self) -> Set[str]:
+        return {
+            unique_id for unique_id, model in self.models.items() if model.is_ephemeral
+        }
+
+    def validate_ephemeral_dependencies(self, manifest) -> None:
+        """Raise if an injected ephemeral that the consumer actually uses calls
+        macros or sources that are not available in the consumer project."""
+
+        injected = {
+            unique_id
+            for unique_id in self.ephemeral_models
+            if unique_id in manifest.nodes
+            and manifest.nodes[unique_id].is_external_node
+        }
+        if not injected:
+            return
+
+        stack = [
+            dependency
+            for node in manifest.nodes.values()
+            if node.unique_id not in injected
+            for dependency in node.depends_on.nodes
+            if dependency in injected
+        ]
+        used: Set[str] = set()
+        while stack:
+            unique_id = stack.pop()
+            if unique_id in used:
+                continue
+            used.add(unique_id)
+            stack.extend(
+                dependency
+                for dependency in manifest.nodes[unique_id].depends_on.nodes
+                if dependency in injected
+            )
+
+        missing_macros: Dict[str, Set[str]] = defaultdict(set)
+        missing_sources: Dict[str, Set[str]] = defaultdict(set)
+        for unique_id in sorted(used):
+            args = self.models[unique_id]
+            for macro_id in args.depends_on_macros:
+                if macro_id.split(".")[1] == "dbt" or macro_id in manifest.macros:
+                    continue
+                missing_macros[macro_id.split(".")[1]].add(unique_id)
+            for source_id in args.depends_on_sources:
+                if source_id not in manifest.sources:
+                    missing_sources[source_id].add(unique_id)
+
+        if not missing_macros and not missing_sources:
+            return
+
+        lines = ["dbt-loom: Injected ephemeral models cannot be compiled here."]
+        for package, models in sorted(missing_macros.items()):
+            macros = sorted(
+                macro_id
+                for unique_id in models
+                for macro_id in self.models[unique_id].depends_on_macros
+                if macro_id.split(".")[1] == package and macro_id not in manifest.macros
+            )
+            lines.append(
+                f"  - Missing macros from package `{package}` "
+                f"({', '.join(macros)}) required by {', '.join(sorted(models))}. "
+                f"Add `{package}` to this project's packages.yml (or dependencies.yml)"
+                " and run `dbt deps`."
+            )
+        for source_id, models in sorted(missing_sources.items()):
+            lines.append(
+                f"  - Missing source `{source_id}` required by "
+                f"{', '.join(sorted(models))}. Define it in this project."
+            )
+
+        raise LoomEphemeralDependencyError("\n".join(lines))
 
     def group_validation_wrapper(self, function) -> Callable:
         """Wrap the check_valid_group_config_node function to inject upstream group names."""
@@ -324,11 +600,14 @@ class dbtLoom(dbtPlugin):
             selected_nodes = identify_node_subgraph(manifest)
 
             # Remove nodes from excluded packages.
-            filtered_nodes = {
-                key: value
-                for key, value in selected_nodes.items()
-                if self.filter_models(manifest_reference, value)
-            }
+            filtered_nodes = add_ephemeral_dependencies(
+                selected_nodes,
+                {
+                    key: value
+                    for key, value in selected_nodes.items()
+                    if self.filter_models(manifest_reference, value)
+                },
+            )
 
             loom_nodes = convert_model_nodes_to_model_node_args(filtered_nodes)
 
