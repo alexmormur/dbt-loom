@@ -3,6 +3,7 @@
 import os
 import re
 from pathlib import Path
+from typing import Optional
 
 import duckdb
 import pytest
@@ -13,6 +14,9 @@ import dbt.exceptions
 UPSTREAM_PATH = Path(__file__).parent.parent / "test_projects" / "ephemeral_upstream"
 MACROS_PATH = UPSTREAM_PATH.parent / "ephemeral_macros"
 DATABASE_PATH = UPSTREAM_PATH.parent / "ephemeral.duckdb"
+
+# Different from the upstream's vars: the consumer must compile the SQL.
+CONSUMER_VARS = {"start_date": "'2024-01-01'", "end_date": "'2024-12-31'"}
 
 V1_TABLE = '"ephemeral"."main"."stg_coaching_session"'
 EPHEMERAL_CTE_PREFIX = "__dbt__cte__stg_coaching_session"
@@ -46,6 +50,8 @@ def make_consumer(
     model_sql: str,
     include_protected_ephemeral: bool = True,
     with_macros: bool = True,
+    project_vars: Optional[dict] = None,
+    manifest_options: Optional[dict] = None,
 ) -> Path:
     (path / "models").mkdir(parents=True)
     _write_yaml(
@@ -56,7 +62,7 @@ def make_consumer(
             "config-version": 2,
             "profile": "ephemeral_consumer",
             # Different from the upstream's vars: the consumer must compile the SQL.
-            "vars": {"start_date": "'2024-01-01'", "end_date": "'2024-12-31'"},
+            "vars": CONSUMER_VARS if project_vars is None else project_vars,
             "models": {"ephemeral_consumer": {"+materialized": "table"}},
         },
     )
@@ -82,6 +88,7 @@ def make_consumer(
                     "name": "ephemeral_upstream",
                     "type": "file",
                     "config": {"path": str(manifest_path)},
+                    **(manifest_options or {}),
                 }
             ],
         },
@@ -193,3 +200,114 @@ def test_unreferenced_ephemeral_does_not_require_macros(
     ).read_text()
     # Unversioned refs still resolve to the latest (v1) table, as before.
     assert compiled.strip() == f"select * from {V1_TABLE}"
+
+
+REF_TENANTS = "select * from {{ ref('ephemeral_upstream', 'int_known_tenants') }}"
+
+
+def test_upstream_sources_and_project_macros_are_injected(
+    tmp_path, monkeypatch, upstream_manifest
+):
+    """The ephemeral reads an upstream source and calls a macro that exists
+    only in the upstream project (which calls another one)."""
+    project = make_consumer(tmp_path / "consumer", upstream_manifest, REF_TENANTS)
+
+    # The second build reuses the partial-parse manifest.
+    for _ in range(2):
+        output = _invoke(project, monkeypatch, "deps", "build")
+        assert output.exception is None, output.exception
+        assert output.success
+
+    compiled = (
+        project / "target/compiled/ephemeral_consumer/models/coaching_sessions.sql"
+    ).read_text()
+    assert 'from "ephemeral"."main"."raw_coach_the_coach"' in compiled
+    assert "tenant in ('emea', 'apac')" in compiled
+
+    with duckdb.connect(str(DATABASE_PATH)) as connection:
+        rows = connection.execute(
+            "select tenant from main.coaching_sessions order by 1"
+        ).fetchall()
+    assert rows == [("apac",), ("emea",)]
+
+    # Injected sources belong to the upstream project and are never selected.
+    output = _invoke(project, monkeypatch, "ls --resource-type source")
+    assert output.success
+    assert output.result == []
+
+
+def test_missing_var_raises_clear_error(tmp_path, monkeypatch, upstream_manifest):
+    project = make_consumer(
+        tmp_path / "consumer",
+        upstream_manifest,
+        REF_V3,
+        project_vars={"end_date": "'2024-12-31'"},
+    )
+
+    output = _invoke(project, monkeypatch, "deps", "compile")
+    assert output.exception is not None
+    message = str(output.exception)
+    assert "Missing var `start_date`" in message
+    assert "end_date" not in message
+
+
+def test_missing_var_is_satisfied_by_cli_vars(tmp_path, monkeypatch, upstream_manifest):
+    project = make_consumer(
+        tmp_path / "consumer",
+        upstream_manifest,
+        REF_V3,
+        project_vars={"end_date": "'2024-12-31'"},
+    )
+    monkeypatch.chdir(project)
+    runner = dbtRunner()
+    runner.invoke(["deps"])
+    output = runner.invoke(["compile", "--vars", "{start_date: \"'2024-01-01'\"}"])
+    assert output.exception is None, output.exception
+
+
+def test_manifest_level_protected_ephemeral_override(
+    tmp_path, monkeypatch, upstream_manifest
+):
+    project = make_consumer(
+        tmp_path / "consumer",
+        upstream_manifest,
+        REF_V3,
+        include_protected_ephemeral=False,
+        manifest_options={"include_protected_ephemeral": True},
+    )
+
+    output = _invoke(project, monkeypatch, "deps", "compile")
+    assert output.exception is None, output.exception
+
+
+REF_PROTECTED_TABLE = (
+    "select * from {{ ref('ephemeral_upstream', 'int_report_counts') }}"
+)
+
+
+def test_protected_table_is_blocked_by_default(
+    tmp_path, monkeypatch, upstream_manifest
+):
+    project = make_consumer(
+        tmp_path / "consumer", upstream_manifest, REF_PROTECTED_TABLE
+    )
+
+    output = _invoke(project, monkeypatch, "deps", "compile")
+    assert isinstance(output.exception, dbt.exceptions.DbtReferenceError)
+
+
+def test_allowed_protected_models(tmp_path, monkeypatch, upstream_manifest):
+    project = make_consumer(
+        tmp_path / "consumer",
+        upstream_manifest,
+        REF_PROTECTED_TABLE,
+        include_protected_ephemeral=False,
+        manifest_options={"allowed_protected_models": ["int_report_counts"]},
+    )
+
+    output = _invoke(project, monkeypatch, "deps", "compile")
+    assert output.exception is None, output.exception
+    compiled = (
+        project / "target/compiled/ephemeral_consumer/models/coaching_sessions.sql"
+    ).read_text()
+    assert '"ephemeral"."main"."int_report_counts"' in compiled

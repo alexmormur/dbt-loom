@@ -3,11 +3,11 @@ from dataclasses import dataclass, field
 import os
 import re
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import yaml
 from dbt.contracts.graph.node_args import ModelNodeArgs
-from dbt.contracts.graph.nodes import ModelNode
+from dbt.contracts.graph.nodes import Macro, ModelNode, SourceDefinition
 from dbt.exceptions import CompilationError
 from dbt.graph.selector import NodeSelector
 
@@ -219,16 +219,40 @@ def build_ephemeral_model_node(model: ModelNode, args: LoomModelNodeArgs) -> Mod
     return model
 
 
-_ORIGINAL_ATTRIBUTES: Dict[Tuple[type, str], Callable] = {}
+_MISSING = object()
+
+# (owner, attribute) -> (raw attribute in owner.__dict__ or _MISSING, original callable)
+_ORIGINAL_ATTRIBUTES: Dict[Tuple[Any, str], Tuple[Any, Callable]] = {}
 
 
-def _patch_once(owner: type, attribute: str, wrapper_factory: Callable) -> None:
+def _patch_once(owner: Any, attribute: str, wrapper_factory: Callable) -> None:
     """Wrap the *original* ``owner.attribute``, so that re-initializing the
-    plugin in the same process replaces the wrapper instead of stacking it."""
+    plugin in the same process (e.g. repeated ``dbtRunner`` invocations)
+    replaces the wrapper instead of stacking it on top of stale instances."""
     key = (owner, attribute)
     if key not in _ORIGINAL_ATTRIBUTES:
-        _ORIGINAL_ATTRIBUTES[key] = getattr(owner, attribute)
-    setattr(owner, attribute, wrapper_factory(_ORIGINAL_ATTRIBUTES[key]))
+        _ORIGINAL_ATTRIBUTES[key] = (
+            vars(owner).get(attribute, _MISSING),
+            getattr(owner, attribute),
+        )
+    setattr(owner, attribute, wrapper_factory(_ORIGINAL_ATTRIBUTES[key][1]))
+
+
+def _restore(owner: Any, attribute: str) -> None:
+    """Undo ``_patch_once`` for ``owner.attribute``, if it was patched."""
+    original = _ORIGINAL_ATTRIBUTES.pop((owner, attribute), None)
+    if original is None:
+        return
+    raw, _ = original
+    if raw is _MISSING:
+        delattr(owner, attribute)
+    else:
+        setattr(owner, attribute, raw)
+
+
+def _restore_all() -> None:
+    for owner, attribute in list(_ORIGINAL_ATTRIBUTES):
+        _restore(owner, attribute)
 
 
 def target_write_path_wrapper(function) -> Callable:
@@ -248,27 +272,22 @@ def target_write_path_wrapper(function) -> Callable:
     return outer_function
 
 
-def graph_member_wrapper(function) -> Callable:
-    """Keep injected ephemerals out of node selection. They belong to the
-    upstream project, so they are only compiled when a consumer node inlines
-    them, never on their own during `dbt compile`, `run` or `build`."""
-
-    def outer_function(inner_self, unique_id) -> bool:
-        node = inner_self.manifest.nodes.get(unique_id)
-        if (
-            isinstance(node, ModelNode)
-            and node.is_external_node
-            and node.is_ephemeral_model
-        ):
-            return False
-        return function(inner_self, unique_id)
-
-    return outer_function
-
-
 class LoomEphemeralDependencyError(CompilationError):
-    """Raised when an injected ephemeral model needs macros or sources that the
-    consumer project does not provide."""
+    """Raised when an injected ephemeral model needs macros, sources or vars
+    that the consumer project does not provide."""
+
+
+# `var("name")` with no default. Dynamic names and vars with defaults are
+# left for dbt to resolve at compile time.
+VAR_WITHOUT_DEFAULT_PATTERN = re.compile(r"""\bvar\(\s*(?:"([^"]+)"|'([^']+)')\s*\)""")
+
+
+def required_vars(raw_code: str) -> Set[str]:
+    """Return the names of vars that ``raw_code`` reads without a default."""
+    return {
+        double or single
+        for double, single in VAR_WITHOUT_DEFAULT_PATTERN.findall(raw_code or "")
+    }
 
 
 def merge_loom_nodes(
@@ -318,6 +337,15 @@ class dbtLoom(dbtPlugin):
 
         self.config: Optional[dbtLoomConfig] = self.read_config(configuration_path)
         self.models: Dict[str, LoomModelNodeArgs] = {}
+        # Protected upstream models that consumers may reference anyway.
+        self.allowed_protected_refs: Set[str] = set()
+        # Upstream sources and macros that injected ephemerals need, keyed by unique_id.
+        self.upstream_sources: Dict[str, Dict] = {}
+        self.upstream_macros: Dict[str, Dict] = {}
+        self.injected_source_ids: Set[str] = set()
+
+        # Drop wrappers left behind by a previous invocation in this process.
+        _restore_all()
 
         if self.config is not None:
             self._patch_ref_protection()
@@ -330,41 +358,42 @@ class dbtLoom(dbtPlugin):
     def _patch_ref_protection(self) -> None:
         """Patch out the ref protection functions for proper protections"""
         import dbt.contracts.graph.manifest
+        from dbt.parser.manifest import ManifestLoader as DbtManifestLoader
 
         fire_event(
             msg="dbt-loom: Patching ref protection methods to support dbt-loom dependencies."
         )
 
-        dbt.contracts.graph.manifest.Manifest.is_invalid_protected_ref = (  # type: ignore
-            self.protected_ephemeral_wrapper(
+        _patch_once(
+            dbt.contracts.graph.manifest.Manifest,
+            "is_invalid_protected_ref",
+            lambda _: self.protected_ref_wrapper(
                 self.dependency_wrapper(is_invalid_protected_ref)
-            )
+            ),
         )
-        dbt.contracts.graph.manifest.Manifest.is_invalid_private_ref = (  # type: ignore
-            self.dependency_wrapper(is_invalid_private_ref)
+        _patch_once(
+            dbt.contracts.graph.manifest.Manifest,
+            "is_invalid_private_ref",
+            lambda _: self.dependency_wrapper(is_invalid_private_ref),
         )
-
-        dbt.parser.manifest.ManifestLoader.check_valid_group_config_node = (  # type: ignore
-            self.group_validation_wrapper(
-                dbt.parser.manifest.ManifestLoader.check_valid_group_config_node  # type: ignore
-            )
+        _patch_once(
+            DbtManifestLoader,
+            "check_valid_group_config_node",
+            self.group_validation_wrapper,
         )
-
-        dbt.contracts.graph.nodes.ModelNode.from_args = (  # type: ignore
-            self.model_node_wrapper(dbt.contracts.graph.nodes.ModelNode.from_args)  # type: ignore
-        )
-
-        from dbt.parser.manifest import ManifestLoader as DbtManifestLoader
-
+        _patch_once(ModelNode, "from_args", self.model_node_wrapper)
         _patch_once(DbtManifestLoader, "load", self.manifest_load_wrapper)
+        _patch_once(
+            DbtManifestLoader, "inject_external_nodes", self.inject_external_wrapper
+        )
         _patch_once(ModelNode, "get_target_write_path", target_write_path_wrapper)
-        _patch_once(NodeSelector, "_is_graph_member", graph_member_wrapper)
+        _patch_once(NodeSelector, "_is_graph_member", self.graph_member_wrapper)
 
     def _patch_plugin_telemetry(self) -> None:
         """Patch the plugin telemetry function to prevent tracking of dbt plugins."""
         import dbt.tracking
 
-        dbt.tracking.track = self.tracking_wrapper(dbt.tracking.track)
+        _patch_once(dbt.tracking, "track", self.tracking_wrapper)
 
     def tracking_wrapper(self, function) -> Callable:
         """Wrap the telemetry `track` function and return early if we're tracking plugin actions."""
@@ -399,16 +428,15 @@ class dbtLoom(dbtPlugin):
 
         return outer_function
 
-    def protected_ephemeral_wrapper(self, function) -> Callable:
-        """Allow refs to protected, loom-injected ephemerals when opted in."""
+    def protected_ref_wrapper(self, function) -> Callable:
+        """Allow refs to protected, loom-injected models that the config allows:
+        protected ephemerals when opted in, and `allowed_protected_models`."""
 
         def outer_function(inner_self, node, target_model, dependencies) -> bool:
             if (
-                self.config is not None
-                and self.config.include_protected_ephemeral
-                and isinstance(target_model, ModelNode)
+                isinstance(target_model, ModelNode)
                 and target_model.is_external_node
-                and target_model.unique_id in self.ephemeral_models
+                and target_model.unique_id in self.allowed_protected_refs
             ):
                 return False
 
@@ -416,12 +444,118 @@ class dbtLoom(dbtPlugin):
 
         return outer_function
 
+    def graph_member_wrapper(self, function) -> Callable:
+        """Keep injected ephemerals, and the upstream sources injected for
+        them, out of node selection. They belong to the upstream project, so
+        they are only compiled when a consumer node inlines them, never on
+        their own during `dbt compile`, `run`, `build` or `source freshness`."""
+
+        def outer_function(inner_self, unique_id) -> bool:
+            if unique_id in self.injected_source_ids:
+                return False
+            node = inner_self.manifest.nodes.get(unique_id)
+            if (
+                isinstance(node, ModelNode)
+                and node.is_external_node
+                and node.is_ephemeral_model
+            ):
+                return False
+            return function(inner_self, unique_id)
+
+        return outer_function
+
+    def inject_external_wrapper(self, function) -> Callable:
+        """After dbt injects the plugin nodes, add the upstream sources and
+        upstream-project macros that the injected ephemerals need."""
+
+        def outer_function(inner_self, *args, **kwargs) -> bool:
+            modified = function(inner_self, *args, **kwargs)
+            local_packages = set(getattr(inner_self, "all_projects", {}) or {})
+            injected = self.inject_ephemeral_resources(
+                inner_self.manifest, local_packages
+            )
+            return modified or injected
+
+        return outer_function
+
+    def inject_ephemeral_resources(self, manifest, local_packages: Set[str]) -> bool:
+        """Add upstream sources and macros to ``manifest``. Anything the consumer
+        defines itself wins. Copies left in a partial-parse manifest by an
+        earlier run are replaced, since their package is not a local one."""
+
+        def is_replaceable(existing) -> bool:
+            return existing is None or existing.package_name not in local_packages
+
+        def is_stale(resource, wanted: Dict[str, Dict]) -> bool:
+            return (
+                resource.package_name in self.manifests
+                and resource.package_name not in local_packages
+                and resource.unique_id not in wanted
+            )
+
+        modified = False
+        for resources, wanted in (
+            (manifest.sources, self.upstream_sources),
+            (manifest.macros, self.upstream_macros),
+        ):
+            for unique_id in [
+                unique_id
+                for unique_id, resource in resources.items()
+                if is_stale(resource, wanted)
+            ]:
+                del resources[unique_id]
+                modified = True
+
+        self.injected_source_ids = set()
+        for source_id, source in self.upstream_sources.items():
+            if not is_replaceable(manifest.sources.get(source_id)):
+                continue
+            try:
+                manifest.sources[source_id] = SourceDefinition.from_dict(source)
+            except Exception as error:
+                fire_event(
+                    msg=f"dbt-loom: Could not inject upstream source `{source_id}`: {error}"
+                )
+                continue
+            self.injected_source_ids.add(source_id)
+            modified = True
+
+        for macro_id, macro in self.upstream_macros.items():
+            if not is_replaceable(manifest.macros.get(macro_id)):
+                continue
+            try:
+                manifest.macros[macro_id] = Macro.from_dict(macro)
+            except Exception as error:
+                fire_event(
+                    msg=f"dbt-loom: Could not inject upstream macro `{macro_id}`: {error}"
+                )
+                continue
+            modified = True
+
+        if modified:
+            # Manifest caches macro lookups by name and package.
+            for cache in ("_macros_by_name", "_macros_by_package"):
+                if hasattr(manifest, cache):
+                    setattr(manifest, cache, None)
+
+        for unique_id in self.ephemeral_models:
+            node = manifest.nodes.get(unique_id)
+            if node is None or not node.is_external_node:
+                continue
+            for source_id in self.models[unique_id].depends_on_sources:
+                if source_id in manifest.sources:
+                    node.depends_on.add_node(source_id)
+
+        return modified
+
     def manifest_load_wrapper(self, function) -> Callable:
         """Validate injected ephemerals once dbt has finished building the manifest."""
 
         def outer_function(inner_self, *args, **kwargs):
             manifest = function(inner_self, *args, **kwargs)
-            self.validate_ephemeral_dependencies(manifest)
+            self.validate_ephemeral_dependencies(
+                manifest, getattr(inner_self, "root_project", None)
+            )
             return manifest
 
         return outer_function
@@ -432,9 +566,22 @@ class dbtLoom(dbtPlugin):
             unique_id for unique_id, model in self.models.items() if model.is_ephemeral
         }
 
-    def validate_ephemeral_dependencies(self, manifest) -> None:
+    @staticmethod
+    def available_vars(root_project, package_name: str) -> Optional[Set[str]]:
+        """Names of the vars a node of ``package_name`` can read in the consumer,
+        or None if they cannot be determined."""
+        try:
+            project_vars = root_project.vars.to_dict()
+            names = set(project_vars)
+            names.update(project_vars.get(package_name) or {})
+            names.update(root_project.cli_vars or {})
+        except AttributeError:
+            return None
+        return names
+
+    def validate_ephemeral_dependencies(self, manifest, root_project=None) -> None:
         """Raise if an injected ephemeral that the consumer actually uses calls
-        macros or sources that are not available in the consumer project."""
+        macros, sources or vars that are not available in the consumer project."""
 
         injected = {
             unique_id
@@ -466,6 +613,7 @@ class dbtLoom(dbtPlugin):
 
         missing_macros: Dict[str, Set[str]] = defaultdict(set)
         missing_sources: Dict[str, Set[str]] = defaultdict(set)
+        missing_vars: Dict[str, Set[str]] = defaultdict(set)
         for unique_id in sorted(used):
             args = self.models[unique_id]
             for macro_id in args.depends_on_macros:
@@ -475,8 +623,13 @@ class dbtLoom(dbtPlugin):
             for source_id in args.depends_on_sources:
                 if source_id not in manifest.sources:
                     missing_sources[source_id].add(unique_id)
+            if root_project is not None:
+                available = self.available_vars(root_project, args.package_name)
+                if available is not None:
+                    for var_name in required_vars(args.raw_code or "") - available:
+                        missing_vars[var_name].add(unique_id)
 
-        if not missing_macros and not missing_sources:
+        if not missing_macros and not missing_sources and not missing_vars:
             return
 
         lines = ["dbt-loom: Injected ephemeral models cannot be compiled here."]
@@ -497,6 +650,12 @@ class dbtLoom(dbtPlugin):
             lines.append(
                 f"  - Missing source `{source_id}` required by "
                 f"{', '.join(sorted(models))}. Define it in this project."
+            )
+        for var_name, models in sorted(missing_vars.items()):
+            lines.append(
+                f"  - Missing var `{var_name}` required by "
+                f"{', '.join(sorted(models))}. Set it under `vars:` in "
+                "dbt_project.yml or pass it with `--vars`."
             )
 
         raise LoomEphemeralDependencyError("\n".join(lines))
@@ -612,6 +771,73 @@ class dbtLoom(dbtPlugin):
             loom_nodes = convert_model_nodes_to_model_node_args(filtered_nodes)
 
             merge_loom_nodes(self.models, loom_nodes, manifest_name)
+
+            self.allowed_protected_refs.update(
+                self.protected_refs_allowed_by(manifest_reference, filtered_nodes)
+            )
+            self.collect_ephemeral_resources(manifest, manifest_name, filtered_nodes)
+
+    def protected_refs_allowed_by(
+        self, reference: ManifestReference, nodes: Dict[str, ManifestNode]
+    ) -> Set[str]:
+        """Unique ids of protected ``nodes`` that ``reference`` allows consumers to ref."""
+        include_ephemeral = (
+            reference.include_protected_ephemeral
+            if reference.include_protected_ephemeral is not None
+            else bool(self.config and self.config.include_protected_ephemeral)
+        )
+        wanted = set(reference.allowed_protected_models)
+        matched: Set[str] = set()
+        allowed: Set[str] = set()
+
+        for unique_id, node in nodes.items():
+            names = {unique_id, node.name}
+            if node.version:
+                names.add(f"{node.name}.v{node.version}")
+            hits = names & wanted
+            matched |= hits
+            if node.access != "protected":
+                continue
+            if hits or (include_ephemeral and node.is_ephemeral):
+                allowed.add(unique_id)
+
+        for entry in sorted(wanted - matched):
+            fire_event(
+                msg=f"dbt-loom: `{entry}` in allowed_protected_models for "
+                f"`{reference.name}` does not match any injected model."
+            )
+        return allowed
+
+    def collect_ephemeral_resources(
+        self, manifest: Dict, manifest_name: str, nodes: Dict[str, ManifestNode]
+    ) -> None:
+        """Remember the upstream sources and upstream-project macros that the
+        injected ephemerals need, so they can be added to the consumer."""
+        upstream_macros = manifest.get("macros", {})
+        upstream_sources = manifest.get("sources", {})
+
+        macro_stack: List[str] = []
+        for node in nodes.values():
+            if not node.is_ephemeral:
+                continue
+            for source_id in node.depends_on_sources:
+                if source_id in upstream_sources:
+                    self.upstream_sources.setdefault(
+                        source_id, upstream_sources[source_id]
+                    )
+            macro_stack.extend(node.depends_on_macros)
+
+        # Third-party macro packages must be installed in the consumer; only
+        # macros defined in the upstream project itself are copied over.
+        while macro_stack:
+            macro_id = macro_stack.pop()
+            if macro_id in self.upstream_macros or macro_id not in upstream_macros:
+                continue
+            macro = upstream_macros[macro_id]
+            if macro.get("package_name") != manifest_name:
+                continue
+            self.upstream_macros[macro_id] = macro
+            macro_stack.extend((macro.get("depends_on") or {}).get("macros", []))
 
     @dbt_hook
     def get_nodes(self) -> PluginNodes:
