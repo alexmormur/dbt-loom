@@ -2,7 +2,9 @@ import os
 from pathlib import Path
 
 import dbt
+import pytest
 from dbt.cli.main import dbtRunner, dbtRunnerResult
+from dbt.version import __version__ as dbt_version
 
 
 import dbt.exceptions
@@ -164,6 +166,10 @@ def test_dbt_core_telemetry_blocking():
     os.chdir(starting_path)
 
 
+@pytest.mark.skipif(
+    tuple(int(part) for part in dbt_version.split(".")[:2]) < (1, 9),
+    reason="Microbatch and --event-time-start were added in dbt-core 1.9.",
+)
 def test_dbt_loom_injects_microbatch_event_time():
     """Verify that dbt-loom injects the 'event_time' property to allow proper microbatch configuration"""
     import shutil
