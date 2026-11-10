@@ -72,6 +72,49 @@ manifests:
       object_name: manifest.json.gz
 ```
 
+## Upstream ephemeral models
+
+Ephemeral models have no relation in the warehouse, so `dbt-loom` cannot point
+at a table for them. Instead, it injects each upstream ephemeral model as a
+real ephemeral model built from its `raw_code`. The consumer project compiles
+that SQL itself and inlines it as a `__dbt__cte__<alias>` CTE, the same way
+dbt handles ephemeral models from installed packages. This also works for
+versioned ephemerals, for example `ref('upstream', 'my_model', v=3)` where v3
+is ephemeral and v1 is a table.
+
+Because the SQL is compiled in the consumer:
+
+- `var()` calls resolve against the consumer's `vars` (and `--vars`), not the
+  values used when the upstream manifest was built.
+- Macros come from the consumer project. Every package whose macros the
+  ephemeral calls (its `depends_on.macros`, for example `dbt_macros_core`)
+  must be in the consumer's `packages.yml`. If one is missing, `dbt-loom`
+  raises a compilation error that names the package, the macros and the
+  ephemeral model. Macros defined only in the upstream project itself are
+  not available.
+- Sources the ephemeral reads with `source()` must also be defined in the
+  consumer project.
+- The models the ephemeral refs are injected too, even if `included_packages`
+  or `excluded_packages` would filter them out.
+
+The upstream manifest must include `raw_code` for the ephemeral (`dbt parse`
+and `dbt compile` both write it). Ephemerals without `raw_code` are skipped.
+Injected ephemerals are only compiled when a consumer model uses them; they are
+never selected on their own by `dbt compile`, `run`, `build` or `ls`.
+
+Access rules still apply. Ephemerals are usually `protected`, which blocks refs
+from other projects. To allow refs to protected upstream ephemerals, opt in
+with `include_protected_ephemeral`. Private ephemerals stay blocked.
+
+```yaml
+include_protected_ephemeral: true # Default: false
+manifests:
+  - name: icoach_source
+    type: file
+    config:
+      path: ../icoach_source/target/manifest.json
+```
+
 ## Enabling Telemetry
 
 By default, the `dbt-loom` plugin blocks outbound telemetry that reports on

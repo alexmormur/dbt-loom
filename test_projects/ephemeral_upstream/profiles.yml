@@ -1,0 +1,7 @@
+ephemeral_upstream:
+  outputs:
+    dev:
+      type: duckdb
+      path: ../ephemeral.duckdb
+      threads: 1
+  target: dev

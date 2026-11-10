@@ -66,6 +66,10 @@ class ManifestNode(BaseModel, use_enum_values=True):
     depends_on_nodes: List[str] = Field(default_factory=list)
     enabled: bool = True
     config: dict = Field(default_factory=dict)
+    alias: Optional[str] = None
+    raw_code: Optional[str] = None
+    language: Optional[str] = None
+    refs: List[Dict] = Field(default_factory=list)
 
     @validator("depends_on_nodes", always=True)
     def default_depends_on_nodes(cls, v, values):
@@ -87,11 +91,34 @@ class ManifestNode(BaseModel, use_enum_values=True):
         return v
 
     @property
+    def is_ephemeral(self) -> bool:
+        return (
+            self.resource_type == NodeType.Model
+            and self.config.get("materialized") == "ephemeral"
+        )
+
+    @property
     def identifier(self) -> str:
+        if self.is_ephemeral:
+            # Ephemerals have no relation; dbt derives the CTE name from the alias.
+            if self.alias:
+                return self.alias
+            return f"{self.name}_v{self.version}" if self.version else self.name
+
         if not self.relation_name:
             return self.name
 
         return RELATION_NAME_QUOTE_PATTERN.sub("", self.relation_name.split(".")[-1])
+
+    @property
+    def depends_on_macros(self) -> List[str]:
+        return [] if self.depends_on is None else list(self.depends_on.macros)
+
+    @property
+    def depends_on_sources(self) -> List[str]:
+        if self.depends_on is None:
+            return []
+        return [node for node in self.depends_on.nodes if node.startswith("source.")]
 
     def dump(self) -> Dict:
         """Dump the ManifestNode to a Dict, with support for pydantic 1 and 2"""

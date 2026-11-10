@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: stg_coaching_report
+    access: public
+    latest_version: 2
+    versions:
+      - v: 1
+      - v: 2
+
+  - name: stg_coach_the_coach
+    access: public
+    latest_version: 2
+    versions:
+      - v: 1
+      - v: 2
+
+  - name: stg_coaching_session
+    access: public
+    latest_version: 1
+    versions:
+      - v: 1
+        config:
+          alias: stg_coaching_session
+      - v: 3
+        config:
+          materialized: ephemeral
+          access: protected

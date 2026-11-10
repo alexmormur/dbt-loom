@@ -117,6 +117,7 @@ class dbtLoomConfig(BaseModel):
 
     manifests: List[ManifestReference]
     enable_telemetry: bool = False
+    include_protected_ephemeral: bool = False
 
 
 class LoomConfigurationError(BaseException):
