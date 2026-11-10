@@ -1,5 +1,6 @@
 """End-to-end tests: a consumer project compiles an upstream versioned ephemeral."""
 
+import json
 import os
 import re
 from pathlib import Path
@@ -99,6 +100,28 @@ def make_consumer(
 
 REF_V3 = "select * from {{ ref('ephemeral_upstream', 'stg_coaching_session', v=3) }}"
 
+V3_UID = "model.ephemeral_upstream.stg_coaching_session.v3"
+REPORT_V2_UID = "model.ephemeral_upstream.stg_coaching_report.v2"
+COACH_V2_UID = "model.ephemeral_upstream.stg_coach_the_coach.v2"
+CONSUMER_UID = "model.ephemeral_consumer.coaching_sessions"
+
+
+def _ls_json(output) -> dict:
+    assert output.exception is None, output.exception
+    assert isinstance(output.result, list)
+    nodes = [json.loads(line) for line in output.result]
+    return {node["unique_id"]: node for node in nodes}
+
+
+def _assert_ephemeral_lineage(manifest: dict) -> None:
+    """v3 sits between its upstream tables and the consumer model."""
+    assert manifest["nodes"][V3_UID]["config"]["materialized"] == "ephemeral"
+    assert set(manifest["parent_map"][V3_UID]) >= {REPORT_V2_UID, COACH_V2_UID}
+    assert CONSUMER_UID in manifest["child_map"][V3_UID]
+    assert V3_UID in manifest["parent_map"][CONSUMER_UID]
+    assert V3_UID in manifest["child_map"][REPORT_V2_UID]
+    assert V3_UID in manifest["child_map"][COACH_V2_UID]
+
 
 def _invoke(project: Path, monkeypatch, *commands):
     monkeypatch.chdir(project)
@@ -136,6 +159,38 @@ def test_versioned_ephemeral_is_compiled_as_cte(
     assert (
         project / "target/compiled/ephemeral_upstream/stg_coaching_session_v3.sql"
     ).exists()
+
+
+def test_injected_ephemeral_is_in_the_lineage(tmp_path, monkeypatch, upstream_manifest):
+    """v3 is a real node in the consumer manifest, list output, selectors, and docs."""
+    project = make_consumer(tmp_path / "consumer", upstream_manifest, REF_V3)
+
+    output = _invoke(project, monkeypatch, "deps", "compile")
+    assert output.exception is None, output.exception
+
+    manifest = json.loads((project / "target/manifest.json").read_text())
+    _assert_ephemeral_lineage(manifest)
+
+    listed = _ls_json(_invoke(project, monkeypatch, "ls --output json"))
+    assert listed[V3_UID]["config"]["materialized"] == "ephemeral"
+    assert listed[V3_UID]["original_file_path"] == ""
+
+    # Ancestors of the consumer model include v3 and the tables it refs, not v1.
+    selected = _ls_json(
+        _invoke(project, monkeypatch, "ls --output json -s +coaching_sessions")
+    )
+    assert V3_UID in selected
+    assert REPORT_V2_UID in selected
+    assert COACH_V2_UID in selected
+    assert CONSUMER_UID in selected
+    assert "model.ephemeral_upstream.stg_coaching_session.v1" not in selected
+
+    # docs generate compiles the project, then writes the manifest the docs site serves.
+    docs = _invoke(project, monkeypatch, "docs generate")
+    assert docs.exception is None, docs.exception
+    assert (project / "target/index.html").exists()
+    documented = json.loads((project / "target/manifest.json").read_text())
+    _assert_ephemeral_lineage(documented)
 
 
 def test_versioned_ephemeral_runs_in_consumer(tmp_path, monkeypatch, upstream_manifest):
@@ -200,6 +255,16 @@ def test_unreferenced_ephemeral_does_not_require_macros(
     ).read_text()
     # Unversioned refs still resolve to the latest (v1) table, as before.
     assert compiled.strip() == f"select * from {V1_TABLE}"
+
+    # The unused ephemeral is listed, and it was not compiled on its own.
+    listed = _ls_json(_invoke(project, monkeypatch, "ls --output json"))
+    ephemeral = listed["model.ephemeral_upstream.stg_coaching_session.v3"]
+    assert ephemeral["config"]["materialized"] == "ephemeral"
+    manifest = json.loads((project / "target/manifest.json").read_text())
+    assert manifest["nodes"][ephemeral["unique_id"]].get("compiled_code") in (None, "")
+    assert not (
+        project / "target/compiled/ephemeral_upstream/stg_coaching_session_v3.sql"
+    ).exists()
 
 
 REF_TENANTS = "select * from {{ ref('ephemeral_upstream', 'int_known_tenants') }}"

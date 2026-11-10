@@ -103,8 +103,13 @@ Because the SQL is compiled in the consumer:
 
 The upstream manifest must include `raw_code` for the ephemeral (`dbt parse`
 and `dbt compile` both write it). Ephemerals without `raw_code` are skipped.
-Injected ephemerals are only compiled when a consumer model uses them; they are
-never selected on their own by `dbt compile`, `run`, `build` or `ls`.
+Injected ephemerals are part of the consumer's lineage: they are nodes in
+`target/manifest.json` (and its `parent_map` / `child_map`), they show up in
+`dbt ls` and graph selectors such as `+my_model`, and they appear in the
+`dbt docs` DAG, with edges from the upstream models they ref to the consumer
+models that use them. `dbt compile`, `run`, `build` and `docs generate` do not
+compile an injected ephemeral on its own. Its SQL is rendered only when a
+downstream model inlines it as a CTE.
 
 Access rules still apply. Ephemerals are usually `protected`, which blocks refs
 from other projects. To allow refs to protected upstream ephemerals, opt in
