@@ -167,7 +167,7 @@ def add_ephemeral_dependencies(
         if node is None or node.depends_on is None:
             continue
 
-        for dependency in node.depends_on.nodes:
+        for dependency in getattr(node.depends_on, "nodes", ()):
             dependency_node = selected_nodes.get(dependency)
             if dependency_node is None:
                 continue
@@ -611,11 +611,12 @@ class dbtLoom(dbtPlugin):
         if not injected:
             return
 
+        # Seeds have a MacroDependsOn, which has no `nodes`.
         stack = [
             dependency
             for node in manifest.nodes.values()
             if node.unique_id not in injected
-            for dependency in node.depends_on.nodes
+            for dependency in getattr(node.depends_on, "nodes", ())
             if dependency in injected
         ]
         used: Set[str] = set()
@@ -626,7 +627,9 @@ class dbtLoom(dbtPlugin):
             used.add(unique_id)
             stack.extend(
                 dependency
-                for dependency in manifest.nodes[unique_id].depends_on.nodes
+                for dependency in getattr(
+                    manifest.nodes[unique_id].depends_on, "nodes", ()
+                )
                 if dependency in injected
             )
 

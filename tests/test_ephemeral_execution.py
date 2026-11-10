@@ -208,6 +208,23 @@ def test_versioned_ephemeral_runs_in_consumer(tmp_path, monkeypatch, upstream_ma
     assert rows == [("10||emea",), ("1||emea",), ("2||emea",)]
 
 
+def test_consumer_seeds_do_not_break_ephemeral_validation(
+    tmp_path, monkeypatch, upstream_manifest
+):
+    """Seeds depend only on macros (MacroDependsOn has no `nodes`)."""
+    project = make_consumer(tmp_path / "consumer", upstream_manifest, REF_V3)
+    (project / "seeds").mkdir()
+    (project / "seeds" / "tenants.csv").write_text("tenant\nemea\n")
+
+    output = _invoke(project, monkeypatch, "deps", "parse")
+    assert output.exception is None, output.exception
+    assert output.success
+
+    manifest = json.loads((project / "target/manifest.json").read_text())
+    assert "seed.ephemeral_consumer.tenants" in manifest["nodes"]
+    _assert_ephemeral_lineage(manifest)
+
+
 def test_protected_ephemeral_requires_opt_in(tmp_path, monkeypatch, upstream_manifest):
     project = make_consumer(
         tmp_path / "consumer",
