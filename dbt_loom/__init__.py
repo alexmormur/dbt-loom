@@ -272,6 +272,27 @@ def target_write_path_wrapper(function) -> Callable:
     return outer_function
 
 
+def compile_node_wrapper(function) -> Callable:
+    """Do not compile an injected ephemeral as its own node.
+
+    ``dbt compile``, ``run``, ``build`` and ``docs generate`` select every
+    graph member. Rendering the ephemeral there fails when nothing in the
+    consumer references it, and it is the wrong SQL anyway. Downstream models
+    still compile it through ``_compile_code`` and inline it as a CTE.
+    """
+
+    def outer_function(inner_self, node, manifest, *args, **kwargs):
+        if (
+            isinstance(node, ModelNode)
+            and node.is_external_node
+            and node.is_ephemeral_model
+        ):
+            return node
+        return function(inner_self, node, manifest, *args, **kwargs)
+
+    return outer_function
+
+
 class LoomEphemeralDependencyError(CompilationError):
     """Raised when an injected ephemeral model needs macros, sources or vars
     that the consumer project does not provide."""
@@ -388,6 +409,9 @@ class dbtLoom(dbtPlugin):
         )
         _patch_once(ModelNode, "get_target_write_path", target_write_path_wrapper)
         _patch_once(NodeSelector, "_is_graph_member", self.graph_member_wrapper)
+        from dbt.compilation import Compiler
+
+        _patch_once(Compiler, "compile_node", compile_node_wrapper)
 
     def _patch_plugin_telemetry(self) -> None:
         """Patch the plugin telemetry function to prevent tracking of dbt plugins."""
@@ -445,20 +469,15 @@ class dbtLoom(dbtPlugin):
         return outer_function
 
     def graph_member_wrapper(self, function) -> Callable:
-        """Keep injected ephemerals, and the upstream sources injected for
-        them, out of node selection. They belong to the upstream project, so
-        they are only compiled when a consumer node inlines them, never on
-        their own during `dbt compile`, `run`, `build` or `source freshness`."""
+        """Keep sources copied in for injected ephemerals out of selection.
+
+        Injected ephemerals stay in the graph: `dbt ls`, graph selectors, and
+        the docs DAG need them. They are not compiled on their own; see
+        ``compile_node_wrapper``.
+        """
 
         def outer_function(inner_self, unique_id) -> bool:
             if unique_id in self.injected_source_ids:
-                return False
-            node = inner_self.manifest.nodes.get(unique_id)
-            if (
-                isinstance(node, ModelNode)
-                and node.is_external_node
-                and node.is_ephemeral_model
-            ):
                 return False
             return function(inner_self, unique_id)
 
