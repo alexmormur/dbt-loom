@@ -1,10 +1,10 @@
 from enum import Enum
 from pathlib import Path
 import re
-from typing import List, Union
+from typing import List, Optional, Union
 from urllib.parse import ParseResult, urlparse
 
-from pydantic import BaseModel, Field, field_validator, model_validator, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from dbt_loom.clients.az_blob import AzureReferenceConfig
 from dbt_loom.clients.dbt_cloud import DbtCloudReferenceConfig
@@ -33,8 +33,9 @@ class FileReferenceConfig(BaseModel):
 
     path: ParseResult
 
-    @validator("path", pre=True, always=True)
-    def default_path(cls, v, values) -> ParseResult:
+    @field_validator("path", mode="before")
+    @classmethod
+    def default_path(cls, v) -> ParseResult:
         """
         Check if the provided path is a valid URL. If not, convert it into an
         absolute file path.
@@ -79,6 +80,11 @@ class ManifestReference(BaseModel):
     excluded_packages: List[str] = Field(default_factory=list)
     included_packages: List[str] = Field(default_factory=list)
     optional: bool = False
+    # Overrides the top-level `include_protected_ephemeral` for this manifest.
+    include_protected_ephemeral: Optional[bool] = None
+    # Protected models that may be referenced anyway, by name (`orders`),
+    # versioned name (`orders.v2`) or unique_id.
+    allowed_protected_models: List[str] = Field(default_factory=list)
 
     @field_validator("config", mode="before")
     @classmethod

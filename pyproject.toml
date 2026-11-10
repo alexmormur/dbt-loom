@@ -6,7 +6,8 @@ authors = [{ name = "Adrienne Yager", email = "adrienne@yager.dev" }]
 requires-python = ">=3.10,<4.0"
 readme = "README.md"
 dependencies = [
-    "dbt-core>=1.6.0,<1.13.0",
+    "dbt-core>=1.7.0,<1.13.0",
+    "pydantic>=2.0,<3",
     "requests>=2.31.0,<3",
     "google-cloud-storage>=2.13.0,<4",
     "boto3>=1.28.84,<2",
