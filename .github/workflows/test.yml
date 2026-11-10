@@ -11,7 +11,13 @@ jobs:
       fail-fast: false
       matrix:
         python-version: [3.12]
-        dbt-version: [1.9.0, 1.10.0, 1.11.0, 1.12.0]
+        dbt-version: [1.7.0, 1.8.0, 1.9.0, 1.10.0, 1.11.0, 1.12.0]
+        include:
+          # dbt-duckdb releases track dbt-core minor versions until 1.9.
+          - dbt-version: 1.7.0
+            dbt-duckdb-version: 1.7.0
+          - dbt-version: 1.8.0
+            dbt-duckdb-version: 1.8.0
 
     runs-on: ubuntu-latest
 
@@ -31,8 +37,20 @@ jobs:
 
       - name: Install dbt-core
         shell: bash
-        run: uv pip install dbt-core~=${{ matrix.dbt-version }} --prerelease allow
+        run: |
+          if [ -n "${{ matrix.dbt-duckdb-version }}" ]; then
+            # Older dbt-core ships its own dbt/adapters; remove the locked
+            # dbt-adapters/dbt-common stack so the files don't overlap.
+            uv pip uninstall dbt-adapters dbt-common dbt-core dbt-duckdb \
+              dbt-core-experimental-parser dbt-protos dbt-semantic-interfaces dbt-extractor
+            uv pip install dbt-core~=${{ matrix.dbt-version }} dbt-duckdb~=${{ matrix.dbt-duckdb-version }} --prerelease allow
+          else
+            uv pip install dbt-core~=${{ matrix.dbt-version }} --prerelease allow
+          fi
 
       - name: Test
         run: |
-          uv run pytest
+          # --no-sync keeps the dbt-core version installed above instead of
+          # re-syncing the environment back to the lockfile.
+          uv run --no-sync dbt --version
+          uv run --no-sync pytest

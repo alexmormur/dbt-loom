@@ -6,6 +6,7 @@ profile: "ephemeral_upstream"
 
 model-paths: ["models"]
 seed-paths: ["seeds"]
+macro-paths: ["macros"]
 
 target-path: "target"
 clean-targets:

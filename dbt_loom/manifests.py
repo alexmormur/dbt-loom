@@ -8,7 +8,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import unquote, urlunparse
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 import requests
 
 from dbt_loom.clients.snowflake_stage import SnowflakeReferenceConfig, SnowflakeClient
@@ -61,9 +61,11 @@ class ManifestNode(BaseModel, use_enum_values=True):
     deprecation_date: Optional[datetime.datetime] = None
     access: Optional[str] = "protected"
     group: Optional[str] = None
-    generated_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
+    generated_at: datetime.datetime = Field(
+        default_factory=lambda: datetime.datetime.now(datetime.timezone.utc)
+    )
     depends_on: Optional[DependsOn] = None
-    depends_on_nodes: List[str] = Field(default_factory=list)
+    depends_on_nodes: List[str] = Field(default_factory=list, validate_default=True)
     enabled: bool = True
     config: dict = Field(default_factory=dict)
     alias: Optional[str] = None
@@ -71,21 +73,21 @@ class ManifestNode(BaseModel, use_enum_values=True):
     language: Optional[str] = None
     refs: List[Dict] = Field(default_factory=list)
 
-    @validator("depends_on_nodes", always=True)
-    def default_depends_on_nodes(cls, v, values):
-        depends_on = values.get("depends_on")
+    @field_validator("depends_on_nodes")
+    @classmethod
+    def default_depends_on_nodes(cls, v, info: ValidationInfo):
+        depends_on = info.data.get("depends_on")
         if depends_on is None:
             return []
 
-        return [
-            node for node in depends_on.nodes if node.split(".")[0] not in ("source")
-        ]
+        return [node for node in depends_on.nodes if node.split(".")[0] != "source"]
 
-    @validator("resource_type", always=True)
-    def fix_resource_types(cls, v, values):
+    @field_validator("resource_type")
+    @classmethod
+    def fix_resource_types(cls, v, info: ValidationInfo):
         """If the resource type does not match the unique_id prefix, then rewrite the resource type."""
 
-        node_type = values.get("unique_id").split(".")[0]
+        node_type = info.data["unique_id"].split(".")[0]
         if v != node_type:
             return node_type
         return v
@@ -121,12 +123,9 @@ class ManifestNode(BaseModel, use_enum_values=True):
         return [node for node in self.depends_on.nodes if node.startswith("source.")]
 
     def dump(self) -> Dict:
-        """Dump the ManifestNode to a Dict, with support for pydantic 1 and 2"""
+        """Dump the ManifestNode to a Dict."""
         exclude_set = {"schema_name", "depends_on", "node_config", "unique_id"}
-        if hasattr(self, "model_dump"):
-            return self.model_dump(exclude=exclude_set)  # type: ignore
-
-        return self.dict(exclude=exclude_set)
+        return self.model_dump(exclude=exclude_set)
 
 
 class UnknownManifestPathType(Exception):
@@ -186,13 +185,11 @@ class ManifestLoader:
         if not file_path.exists():
             raise LoomConfigurationError(f"The path `{file_path}` does not exist.")
 
-        with open(file_path, encoding="utf-8") as file:
-            content = file.read()
-        if is_gzipped(content.encode()):
-            with gzip.GzipFile(content) as gz_file:
-                return json.load(gz_file)
+        content = file_path.read_bytes()
+        if is_gzipped(content):
+            content = gzip.decompress(content)
 
-        return json.loads(content)
+        return json.loads(content.decode("utf-8"))
 
     @staticmethod
     def load_from_http(config: FileReferenceConfig) -> Dict:

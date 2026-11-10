@@ -26,3 +26,11 @@ models:
         config:
           materialized: ephemeral
           access: protected
+
+  - name: int_known_tenants
+    access: protected
+    config:
+      materialized: ephemeral
+
+  - name: int_report_counts
+    access: protected

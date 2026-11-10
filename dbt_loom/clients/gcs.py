@@ -49,6 +49,7 @@ class GCSClient:
         if self.impersonate_service_account:
             try:
                 import google.auth
+                from google.auth import impersonated_credentials
             except ImportError:
                 fire_event(
                     msg="dbt-loom expected google-auth to be installed for service account impersonation."
@@ -59,7 +60,7 @@ class GCSClient:
                 if self.credentials is None
                 else google.auth.load_credentials_from_file(self.credentials)
             )
-            impersonated_credentials = google.auth.impersonated_credentials.Credentials(
+            target_credentials = impersonated_credentials.Credentials(
                 source_credentials=source_credentials,
                 target_principal=self.impersonate_service_account,
                 target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
@@ -69,7 +70,7 @@ class GCSClient:
                 msg=f"Impersonating service account '{self.impersonate_service_account}' for GCS access."
             )
             client = storage.Client(
-                project=self.project_id, credentials=impersonated_credentials
+                project=self.project_id, credentials=target_credentials
             )
         else:
             try:
@@ -96,7 +97,6 @@ class GCSClient:
         content = blob.download_as_bytes()
 
         if is_gzipped(content):
-            compressed_manifest = blob.download_as_bytes()
             with gzip.GzipFile(fileobj=BytesIO(content)) as gzip_file:
                 manifest_json = gzip_file.read().decode("utf-8")
         else:

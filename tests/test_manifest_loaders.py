@@ -50,6 +50,18 @@ def test_load_from_local_filesystem_utf8(tmp_path):
     assert ManifestLoader.load_from_local_filesystem(file_config) == expected
 
 
+def test_load_from_local_filesystem_gzip(tmp_path):
+    """Confirm gzipped local manifests are decompressed."""
+    import gzip
+
+    path = tmp_path / "manifest.json.gz"
+    expected = {"description": "café"}
+    path.write_bytes(gzip.compress(json.dumps(expected).encode("utf-8")))
+    file_config = FileReferenceConfig(path=str(path))  # type: ignore
+
+    assert ManifestLoader.load_from_local_filesystem(file_config) == expected
+
+
 def test_load_from_local_filesystem_local_path(example_file):
     """Test that ManifestLoader can load a local JSON file."""
 

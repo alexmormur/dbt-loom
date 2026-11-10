@@ -60,7 +60,7 @@ class AzureClient:
         except Exception as e:
             raise Exception(
                 "Unable to connect to Azure. Please confirm your credentials, connection details, and network."
-            )
+            ) from e
 
         # Deserialize the body of the object.
         try:
