@@ -94,6 +94,30 @@ class LoomModelNodeArgs(ModelNodeArgs):
         return self.resource_type == NodeType.Model and self.materialized == "ephemeral"
 
 
+def access_for_node(node: dict, is_ephemeral: bool, unique_id: str) -> str:
+    """Access to store on an injected node.
+
+    dbt rejects an ephemeral model whose access is public. A version often sets
+    ``access: protected`` only under ``config`` while the node's top-level
+    ``access`` stays public (the project default). Prefer a non-public config
+    value, and never inject a public ephemeral.
+    """
+    access = node.get("access")
+    config_access = (node.get("config") or {}).get("access")
+    if access is None:
+        access = config_access or "protected"
+    if is_ephemeral and access == "public":
+        if config_access in ("protected", "private"):
+            access = config_access
+        else:
+            fire_event(
+                msg=f"dbt-loom: `{unique_id}` is ephemeral with access public, "
+                "which dbt rejects. Injecting it as protected."
+            )
+            access = "protected"
+    return access
+
+
 def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
     """
     Identify all nodes that should be selected from the manifest, and return ManifestNodes.
@@ -123,8 +147,7 @@ def identify_node_subgraph(manifest) -> Dict[str, ManifestNode]:
             )
             continue
 
-        if node.get("access") is None:
-            node["access"] = node.get("config", {}).get("access", "protected")
+        node["access"] = access_for_node(node, is_ephemeral, unique_id)
 
         # Versions may be floats or strings. Standardize on strings for compatibility.
         for key in ("version", "latest_version"):

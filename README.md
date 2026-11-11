@@ -330,6 +330,8 @@ models that use them. `dbt compile`, `run`, `build` and `docs generate` do not
 compile an injected ephemeral on its own. Its SQL is rendered only when a
 downstream model inlines it as a CTE.
 
+dbt rejects an ephemeral model with `access: public`. If a version is ephemeral and the manifest still has top-level `access: public` (the project default) while `config.access` is `protected` or `private`, dbt-loom uses that config value. If both say public, the ephemeral is injected as `protected` so the consumer parse does not fail.
+
 Access rules still apply. Ephemerals are usually `protected`, which blocks refs
 from other projects. To allow refs to protected upstream ephemerals, opt in
 with `include_protected_ephemeral`, either for every manifest or per manifest
