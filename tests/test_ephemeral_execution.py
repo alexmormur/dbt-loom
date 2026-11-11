@@ -286,7 +286,8 @@ def test_public_ephemeral_version_compiles_in_consumer(tmp_path, monkeypatch):
     compiled = (
         project / "target/compiled/ephemeral_consumer/models/coaching_sessions.sql"
     ).read_text()
-    assert "__dbt__cte__STG_H_MONTH_V2" in compiled
+    # dbt < 1.8 names the CTE after the model name rather than the versioned alias.
+    assert re.search(r"__dbt__cte__STG_H_MONTH(_V2)?\b", compiled)
     assert "DEV_DB.STAGE.STG_H_MONTH" not in compiled
 
 
