@@ -322,6 +322,8 @@ Because the SQL is compiled in the consumer:
 
 The upstream manifest must include `raw_code` for the ephemeral (`dbt parse`
 and `dbt compile` both write it). Ephemerals without `raw_code` are skipped.
+`dbt ls --output json` shows the upstream `config.materialized` and `config.access`, not a default view with protected access.
+
 Injected ephemerals are part of the consumer's lineage: they are nodes in
 `target/manifest.json` (and its `parent_map` / `child_map`), they show up in
 `dbt ls` and graph selectors such as `+my_model`, and they appear in the
@@ -329,6 +331,8 @@ Injected ephemerals are part of the consumer's lineage: they are nodes in
 models that use them. `dbt compile`, `run`, `build` and `docs generate` do not
 compile an injected ephemeral on its own. Its SQL is rendered only when a
 downstream model inlines it as a CTE.
+
+dbt rejects an ephemeral model with `access: public`. If a version is ephemeral and the manifest still has top-level `access: public` (the project default) while `config.access` is `protected` or `private`, dbt-loom uses that config value. If both say public, the ephemeral is injected as `protected` so the consumer parse does not fail.
 
 Access rules still apply. Ephemerals are usually `protected`, which blocks refs
 from other projects. To allow refs to protected upstream ephemerals, opt in

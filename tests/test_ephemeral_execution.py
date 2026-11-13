@@ -225,6 +225,132 @@ def test_consumer_seeds_do_not_break_ephemeral_validation(
     _assert_ephemeral_lineage(manifest)
 
 
+def test_public_ephemeral_version_compiles_in_consumer(tmp_path, monkeypatch):
+    """latest_version can stay on the table while a later version is ephemeral.
+
+    The manifest node may still say access public (the project default) while
+    the version config says protected. dbt rejects a public ephemeral, so the
+    consumer parse must not die on that node.
+    """
+    manifest_path = tmp_path / "ms2_source.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"project_name": "ms2_source"},
+                "nodes": {
+                    "model.ms2_source.STG_H_MONTH.v1": {
+                        "unique_id": "model.ms2_source.STG_H_MONTH.v1",
+                        "name": "STG_H_MONTH",
+                        "package_name": "ms2_source",
+                        "schema": "STAGE",
+                        "database": "DEV_DB",
+                        "resource_type": "model",
+                        "access": "public",
+                        "version": 1,
+                        "latest_version": 1,
+                        "alias": "STG_H_MONTH",
+                        "relation_name": "DEV_DB.STAGE.STG_H_MONTH",
+                        "config": {"materialized": "table", "access": "public"},
+                    },
+                    "model.ms2_source.STG_H_MONTH.v2": {
+                        "unique_id": "model.ms2_source.STG_H_MONTH.v2",
+                        "name": "STG_H_MONTH",
+                        "package_name": "ms2_source",
+                        "schema": "STAGE",
+                        "database": "DEV_DB",
+                        "resource_type": "model",
+                        "access": "public",
+                        "version": 2,
+                        "latest_version": 1,
+                        "alias": "STG_H_MONTH_V2",
+                        "relation_name": None,
+                        "raw_code": "select 1 as id",
+                        "config": {
+                            "materialized": "ephemeral",
+                            "access": "protected",
+                        },
+                    },
+                },
+            }
+        )
+    )
+    project = make_consumer(
+        tmp_path / "consumer",
+        manifest_path,
+        "select * from {{ ref('ms2_source', 'STG_H_MONTH', v=2) }}",
+        with_macros=False,
+    )
+
+    output = _invoke(project, monkeypatch, "compile")
+    assert output.exception is None, output.exception
+    compiled = (
+        project / "target/compiled/ephemeral_consumer/models/coaching_sessions.sql"
+    ).read_text()
+    # dbt < 1.8 names the CTE after the model name rather than the versioned alias.
+    assert re.search(r"__dbt__cte__STG_H_MONTH(_V2)?\b", compiled)
+    assert "DEV_DB.STAGE.STG_H_MONTH" not in compiled
+
+    listed = _ls_json(
+        _invoke(project, monkeypatch, "ls --output json --select ms2_source.STG_H_MONTH")
+    )
+    assert listed["model.ms2_source.STG_H_MONTH.v1"]["config"]["materialized"] == "table"
+    assert listed["model.ms2_source.STG_H_MONTH.v1"]["config"]["access"] == "public"
+    assert listed["model.ms2_source.STG_H_MONTH.v2"]["config"]["materialized"] == "ephemeral"
+    assert listed["model.ms2_source.STG_H_MONTH.v2"]["config"]["access"] == "protected"
+
+
+def test_ephemeral_alias_matching_v1_does_not_abort_parse(tmp_path, monkeypatch):
+    """An ephemeral version with the same alias as v1 is not a second table."""
+    manifest_path = tmp_path / "ms2_source.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"project_name": "ms2_source"},
+                "nodes": {
+                    "model.ms2_source.STG_H_MONTH.v1": {
+                        "unique_id": "model.ms2_source.STG_H_MONTH.v1",
+                        "name": "STG_H_MONTH",
+                        "package_name": "ms2_source",
+                        "schema": "STAGE",
+                        "database": "DEV_DB",
+                        "resource_type": "model",
+                        "access": "public",
+                        "version": 1,
+                        "latest_version": 1,
+                        "alias": "STG_H_MONTH",
+                        "relation_name": "DEV_DB.STAGE.STG_H_MONTH",
+                        "config": {"materialized": "table", "access": "public"},
+                    },
+                    "model.ms2_source.STG_H_MONTH.v2": {
+                        "unique_id": "model.ms2_source.STG_H_MONTH.v2",
+                        "name": "STG_H_MONTH",
+                        "package_name": "ms2_source",
+                        "schema": "STAGE",
+                        "database": "DEV_DB",
+                        "resource_type": "model",
+                        "access": "protected",
+                        "version": 2,
+                        "latest_version": 1,
+                        "alias": "STG_H_MONTH",
+                        "relation_name": None,
+                        "raw_code": "select 1 as id",
+                        "config": {"materialized": "ephemeral", "access": "protected"},
+                    },
+                },
+            }
+        )
+    )
+    project = make_consumer(
+        tmp_path / "consumer",
+        manifest_path,
+        "select * from {{ ref('ms2_source', 'STG_H_MONTH', v=2) }}",
+        with_macros=False,
+    )
+
+    output = _invoke(project, monkeypatch, "compile")
+    assert output.exception is None, output.exception
+
+
 def test_protected_ephemeral_requires_opt_in(tmp_path, monkeypatch, upstream_manifest):
     project = make_consumer(
         tmp_path / "consumer",

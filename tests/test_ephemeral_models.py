@@ -137,6 +137,24 @@ def test_ephemeral_without_raw_code_is_skipped():
     assert V3_UID not in identify_node_subgraph(manifest)
 
 
+def test_public_ephemeral_version_uses_protected_config_access():
+    """A versioned ephemeral can carry access public on the node and protected in config."""
+    manifest = _manifest()
+    manifest["nodes"][V3_UID]["access"] = "public"
+    manifest["nodes"][V3_UID]["latest_version"] = 1
+    manifest["nodes"][V3_UID]["config"]["access"] = "protected"
+
+    assert identify_node_subgraph(manifest)[V3_UID].access == "protected"
+
+
+def test_public_ephemeral_without_config_access_is_not_injected_as_public():
+    manifest = _manifest()
+    manifest["nodes"][V3_UID]["access"] = "public"
+    manifest["nodes"][V3_UID]["config"].pop("access")
+
+    assert identify_node_subgraph(manifest)[V3_UID].access == "protected"
+
+
 def test_ephemeral_identifier_falls_back_to_versioned_name():
     manifest = _manifest()
     del manifest["nodes"][V3_UID]["alias"]
