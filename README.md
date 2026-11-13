@@ -322,6 +322,8 @@ Because the SQL is compiled in the consumer:
 
 The upstream manifest must include `raw_code` for the ephemeral (`dbt parse`
 and `dbt compile` both write it). Ephemerals without `raw_code` are skipped.
+`dbt ls --output json` shows the upstream `config.materialized` and `config.access`, not a default view with protected access.
+
 Injected ephemerals are part of the consumer's lineage: they are nodes in
 `target/manifest.json` (and its `parent_map` / `child_map`), they show up in
 `dbt ls` and graph selectors such as `+my_model`, and they appear in the

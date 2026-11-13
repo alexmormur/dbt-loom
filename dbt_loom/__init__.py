@@ -295,6 +295,52 @@ def target_write_path_wrapper(function) -> Callable:
     return outer_function
 
 
+def apply_upstream_config(model: ModelNode, args: LoomModelNodeArgs) -> None:
+    """Copy the upstream materialization and access onto the config `dbt ls` prints.
+
+    ``ModelNode.from_args`` builds a fresh config that defaults to a view with
+    protected access, so the JSON hides what the upstream manifest actually said.
+    """
+    if args.materialized:
+        model.config.materialized = args.materialized
+        if isinstance(model.unrendered_config, dict):
+            model.unrendered_config["materialized"] = args.materialized
+    access = getattr(args, "access", None)
+    if access is None or not hasattr(model.config, "access"):
+        return
+    try:
+        from dbt.artifacts.resources.types import AccessType
+    except ImportError:
+        from dbt.node_types import AccessType  # type: ignore
+
+    model.config.access = AccessType(access)
+
+
+def resource_uniqueness_wrapper(function) -> Callable:
+    """Leave injected ephemerals out of dbt's duplicate-relation check.
+
+    That check builds ``database.schema.alias`` for every relational node,
+    and an ephemeral is relational even though it has no table. A version
+    whose alias matches v1 then aborts the consumer parse.
+    """
+
+    def outer_function(manifest, config):
+        hidden = {}
+        for unique_id, node in list(manifest.nodes.items()):
+            if (
+                isinstance(node, ModelNode)
+                and node.is_external_node
+                and node.is_ephemeral_model
+            ):
+                hidden[unique_id] = manifest.nodes.pop(unique_id)
+        try:
+            return function(manifest, config)
+        finally:
+            manifest.nodes.update(hidden)
+
+    return outer_function
+
+
 def compile_node_wrapper(function) -> Callable:
     """Do not compile an injected ephemeral as its own node.
 
@@ -435,6 +481,13 @@ class dbtLoom(dbtPlugin):
         from dbt.compilation import Compiler
 
         _patch_once(Compiler, "compile_node", compile_node_wrapper)
+        import dbt.parser.manifest as manifest_parser
+
+        _patch_once(
+            manifest_parser,
+            "_check_resource_uniqueness",
+            resource_uniqueness_wrapper,
+        )
 
     def _patch_plugin_telemetry(self) -> None:
         """Patch the plugin telemetry function to prevent tracking of dbt plugins."""
@@ -469,6 +522,7 @@ class dbtLoom(dbtPlugin):
             model = function(args)
             model.group = args.group
             model.config.event_time = args.event_time
+            apply_upstream_config(model, args)
             if getattr(args, "is_ephemeral", False):
                 model = build_ephemeral_model_node(model, args)
             return model
